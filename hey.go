@@ -46,15 +46,16 @@ var (
 	accept      = flag.String("A", "", "")
 	contentType = flag.String("T", "text/html", "")
 	authHeader  = flag.String("a", "", "")
-	hostHeader  = flag.String("host", "", "")
 
 	output = flag.String("o", "", "")
 
 	c = flag.Int("c", 50, "")
 	n = flag.Int("n", 200, "")
 	q = flag.Float64("q", 0, "")
-	t = flag.Int("t", 20, "")
-	z = flag.Duration("z", 0, "")
+	z = flag.Duration("z", time.Duration(30)*time.Second, "")
+
+	t     = flag.Int("t", 10, "")
+	pause = flag.Duration("p", time.Duration(1)*time.Millisecond, "")
 
 	h2   = flag.Bool("h2", false, "")
 	cpus = flag.Int("cpus", runtime.GOMAXPROCS(-1), "")
@@ -63,6 +64,8 @@ var (
 	disableKeepAlives  = flag.Bool("disable-keepalive", false, "")
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
 	proxyAddr          = flag.String("x", "", "")
+
+	stream = flag.Bool("stream", false, "")
 )
 
 var usage = `Usage: hey [options...] <url>
@@ -71,9 +74,11 @@ Options:
   -n  Number of requests to run. Default is 200.
   -c  Number of requests to run concurrently. Total number of requests cannot
       be smaller than the concurrency level. Default is 50.
-  -q  Rate limit, in queries per second (QPS). Default is no rate limit.
+  -q  Rate limit, if 'stream' is false it defines 'queries per second', otherwise 'events per second'. 
+			Default is no rate limit.
   -z  Duration of application to send requests. When duration is reached,
       application stops and exits. If duration is specified, n is ignored.
+			Default is 30 seconds.
       Examples: -z 10s -z 3m.
   -o  Output type. If none provided, a summary is printed.
       "csv" is the only supported alternative. Dumps the response
@@ -82,7 +87,7 @@ Options:
   -m  HTTP method, one of GET, POST, PUT, DELETE, HEAD, OPTIONS.
   -H  Custom HTTP header. You can specify as many as needed by repeating the flag.
       For example, -H "Accept: text/html" -H "Content-Type: application/xml" .
-  -t  Timeout for each request in seconds. Default is 20, use 0 for infinite.
+  -t  Timeout for each request in seconds. Default is 10, use 0 for infinite.
   -A  HTTP Accept header.
   -d  HTTP request body.
   -D  HTTP request body from file. For example, /home/user/file.txt or ./file.txt.
@@ -91,14 +96,14 @@ Options:
   -x  HTTP Proxy address as host:port.
   -h2 Enable HTTP/2.
 
-  -host	HTTP Host header.
-
   -disable-compression  Disable compression.
   -disable-keepalive    Disable keep-alive, prevents re-use of TCP
                         connections between different HTTP requests.
   -disable-redirects    Disable following of HTTP redirects
   -cpus                 Number of used cpu cores.
                         (default for current machine is %d cores)
+
+	-stream Use streaming via http connection for sending requests. Default is false.
 `
 
 func main() {
@@ -158,14 +163,17 @@ func main() {
 		header.Set("Accept", *accept)
 	}
 
-	// set basic auth if set
-	var username, password string
-	if *authHeader != "" {
-		match, err := parseInputWithRegexp(*authHeader, authRegexp)
+	if *output != "csv" && *output != "" {
+		usageAndExit("Invalid output type; only csv is supported.")
+	}
+
+	var proxyURL *gourl.URL
+	if *proxyAddr != "" {
+		var err error
+		proxyURL, err = gourl.Parse(*proxyAddr)
 		if err != nil {
 			usageAndExit(err.Error())
 		}
-		username, password = match[1], match[2]
 	}
 
 	var bodyAll []byte
@@ -180,49 +188,65 @@ func main() {
 		bodyAll = slurp
 	}
 
-	if *output != "csv" && *output != "" {
-		usageAndExit("Invalid output type; only csv is supported.")
-	}
-
-	var proxyURL *gourl.URL
-	if *proxyAddr != "" {
-		var err error
-		proxyURL, err = gourl.Parse(*proxyAddr)
+	// retrieve username and password
+	var username, password string
+	if *authHeader != "" {
+		match, err := parseInputWithRegexp(*authHeader, authRegexp)
 		if err != nil {
 			usageAndExit(err.Error())
 		}
+		username, password = match[1], match[2]
 	}
 
-	req, err := http.NewRequest(method, url, nil)
-	if err != nil {
-		usageAndExit(err.Error())
-	}
-	req.ContentLength = int64(len(bodyAll))
-	if username != "" || password != "" {
-		req.SetBasicAuth(username, password)
-	}
-
-	// set host header if set
-	if *hostHeader != "" {
-		req.Host = *hostHeader
-	}
-
-	ua := req.UserAgent()
+	// add user agent to header
+	ua := header.Get("User-Agent")
 	if ua == "" {
 		ua = heyUA
 	} else {
 		ua += " " + heyUA
 	}
 	header.Set("User-Agent", ua)
-	req.Header = header
+
+	var workerReq requester.Req
+	if *stream {
+		workerReq = &requester.StreamReq{
+			Method:        method,
+			Url:           url,
+			RequestBody:   [][]byte{bodyAll},
+			Header:        header,
+			Username:      username,
+			Password:      password,
+			Timeout:       time.Duration(*t) * time.Second,
+			RunTimeout:    dur,
+			PauseDuration: *pause,
+			EPS:           q,
+		}
+
+	} else {
+
+		req, err := http.NewRequest(method, url, nil)
+		if err != nil {
+			usageAndExit(err.Error())
+		}
+		req.ContentLength = int64(len(bodyAll))
+
+		if username != "" || password != "" {
+			req.SetBasicAuth(username, password)
+		}
+		req.Header = header
+
+		workerReq = &requester.SimpleReq{
+			Request:     req,
+			RequestBody: bodyAll,
+			Timeout:     *t,
+			QPS:         q,
+		}
+	}
 
 	w := &requester.Work{
-		Request:            req,
-		RequestBody:        bodyAll,
+		Req:                workerReq,
 		N:                  num,
 		C:                  conc,
-		QPS:                q,
-		Timeout:            *t,
 		DisableCompression: *disableCompression,
 		DisableKeepAlives:  *disableKeepAlives,
 		DisableRedirects:   *disableRedirects,

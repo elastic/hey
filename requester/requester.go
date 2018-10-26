@@ -17,7 +17,9 @@ package requester
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -46,11 +48,126 @@ type result struct {
 	contentLength int64
 }
 
-type Work struct {
-	// Request is the request to be made.
-	Request *http.Request
+type StreamReq struct {
+	Method, Url string
+	RequestBody [][]byte
+	Header      http.Header
+	Username    string
+	Password    string
 
+	// Timeout per request in duration.
+	Timeout time.Duration
+
+	// RunTimeout in duration.
+	RunTimeout time.Duration
+
+	// Pause between streaming events. Ignored if EPS is set.
+	PauseDuration time.Duration
+
+	// EPS is the rate limit in events per second.
+	EPS float64
+}
+
+func (r *StreamReq) makeRequest(ctx context.Context, throttle <-chan time.Time) (*http.Request, context.CancelFunc) {
+	pReader, pWriter := io.Pipe()
+	req, err := http.NewRequest(r.Method, r.Url, pReader)
+	if err != nil {
+		panic(err)
+	}
+	//set auth
+	if r.Username != "" || r.Password != "" {
+		req.SetBasicAuth(r.Username, r.Password)
+	}
+
+	// deep copy of the Header
+	req.Header = make(http.Header, len(r.Header))
+	for k, s := range r.Header {
+		req.Header[k] = append([]string(nil), s...)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
+
+	go func(w io.WriteCloser) {
+		defer w.Close()
+		var pW = w
+
+		for {
+			for _, line := range r.RequestBody {
+				select {
+				case <-ctx.Done():
+					fmt.Println("[debug] context done")
+					return
+				default:
+					//fmt.Println("[debug] write to pipe")
+					if _, err := pW.Write(line); err != nil {
+						fmt.Println("[debug] error writing to pipe")
+						return
+					}
+					if r.qps() > 0 {
+						<-throttle
+						fmt.Println("[debug] throttle")
+					} else {
+						time.Sleep(r.PauseDuration)
+					}
+
+				}
+
+			}
+		}
+	}(pWriter)
+	return req, cancel
+}
+
+func (r *StreamReq) ctxRun() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), r.RunTimeout)
+}
+func (r *StreamReq) clientTimeout() time.Duration {
+	return r.RunTimeout
+}
+func (r *StreamReq) qps() float64 {
+	return r.EPS
+}
+
+type SimpleReq struct {
+	// Request is the request to be made.
+	Request     *http.Request
 	RequestBody []byte
+
+	// Request Timeout in seconds.
+	Timeout int
+
+	// Qps is the rate limit in queries per second.
+	QPS float64
+}
+
+func (r *SimpleReq) makeRequest(ctx context.Context, throttle <-chan time.Time) (*http.Request, context.CancelFunc) {
+	if r.QPS > 0 {
+		<-throttle
+	}
+	return cloneRequest(r.Request, r.RequestBody), func() {}
+}
+
+func (r *SimpleReq) ctxRun() (context.Context, context.CancelFunc) {
+	return context.TODO(), func() {}
+}
+
+func (r *SimpleReq) clientTimeout() time.Duration {
+	return time.Duration(r.Timeout) * time.Second
+}
+
+func (r *SimpleReq) qps() float64 {
+	return r.QPS
+}
+
+type Req interface {
+	makeRequest(context.Context, <-chan time.Time) (*http.Request, context.CancelFunc)
+	ctxRun() (context.Context, context.CancelFunc)
+	clientTimeout() time.Duration
+	qps() float64
+}
+
+type Work struct {
+	Req Req
 
 	// N is the total number of requests to make.
 	N int
@@ -60,12 +177,6 @@ type Work struct {
 
 	// H2 is an option to make HTTP/2 requests
 	H2 bool
-
-	// Timeout in seconds.
-	Timeout int
-
-	// Qps is the rate limit in queries per second.
-	QPS float64
 
 	// DisableCompression is an option to disable compression in response
 	DisableCompression bool
@@ -112,7 +223,10 @@ func (b *Work) Run() {
 	go func() {
 		runReporter(b.report)
 	}()
-	b.runWorkers()
+
+	ctx, cancel := b.Req.ctxRun()
+	b.runWorkers(ctx)
+	cancel()
 	b.Finish()
 }
 
@@ -131,13 +245,14 @@ func (b *Work) Finish() {
 	b.report.finalize(total)
 }
 
-func (b *Work) makeRequest(c *http.Client) {
-	s := time.Now()
+func (b *Work) sendReq(ctx context.Context, client *http.Client, throttle <-chan time.Time) {
 	var size int64
 	var code int
 	var dnsStart, connStart, resStart, reqStart, delayStart time.Time
-	var dnsDuration, connDuration, resDuration, reqDuration, delayDuration time.Duration
-	req := cloneRequest(b.Request, b.RequestBody)
+	var dnsDuration, connDuration, reqDuration, delayDuration, resDuration time.Duration
+
+	req, cancel := b.Req.makeRequest(ctx, throttle)
+
 	trace := &httptrace.ClientTrace{
 		DNSStart: func(info httptrace.DNSStartInfo) {
 			dnsStart = time.Now()
@@ -164,16 +279,19 @@ func (b *Work) makeRequest(c *http.Client) {
 		},
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-	resp, err := c.Do(req)
+	st := time.Now()
+	resp, err := client.Do(req)
 	if err == nil {
 		size = resp.ContentLength
 		code = resp.StatusCode
 		io.Copy(ioutil.Discard, resp.Body)
 		resp.Body.Close()
 	}
+
+	cancel()
 	t := time.Now()
 	resDuration = t.Sub(resStart)
-	finish := t.Sub(s)
+	finish := t.Sub(st)
 	b.results <- &result{
 		statusCode:    code,
 		duration:      finish,
@@ -185,12 +303,13 @@ func (b *Work) makeRequest(c *http.Client) {
 		resDuration:   resDuration,
 		delayDuration: delayDuration,
 	}
+
 }
 
-func (b *Work) runWorker(client *http.Client, n int) {
+func (b *Work) runWorker(ctx context.Context, client *http.Client, n int) {
 	var throttle <-chan time.Time
-	if b.QPS > 0 {
-		throttle = time.Tick(time.Duration(1e6/(b.QPS)) * time.Microsecond)
+	if b.Req.qps() > 0 {
+		throttle = time.Tick(time.Duration(1e6/(b.Req.qps())) * time.Microsecond)
 	}
 
 	if b.DisableRedirects {
@@ -198,21 +317,19 @@ func (b *Work) runWorker(client *http.Client, n int) {
 			return http.ErrUseLastResponse
 		}
 	}
+
 	for i := 0; i < n; i++ {
 		// Check if application is stopped. Do not send into a closed channel.
 		select {
 		case <-b.stopCh:
 			return
 		default:
-			if b.QPS > 0 {
-				<-throttle
-			}
-			b.makeRequest(client)
+			b.sendReq(ctx, client, throttle)
 		}
 	}
 }
 
-func (b *Work) runWorkers() {
+func (b *Work) runWorkers(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(b.C)
 
@@ -230,12 +347,12 @@ func (b *Work) runWorkers() {
 	} else {
 		tr.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	}
-	client := &http.Client{Transport: tr, Timeout: time.Duration(b.Timeout) * time.Second}
+	client := &http.Client{Transport: tr, Timeout: b.Req.clientTimeout()}
 
 	// Ignore the case where b.N % b.C != 0.
 	for i := 0; i < b.C; i++ {
 		go func() {
-			b.runWorker(client, b.N/b.C)
+			b.runWorker(ctx, client, b.N/b.C)
 			wg.Done()
 		}()
 	}
