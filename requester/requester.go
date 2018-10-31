@@ -50,7 +50,7 @@ type result struct {
 
 type StreamReq struct {
 	Method, Url string
-	RequestBody [][]byte
+	RequestBody []byte
 	Header      http.Header
 	Username    string
 	Password    string
@@ -92,26 +92,19 @@ func (r *StreamReq) makeRequest(ctx context.Context, throttle <-chan time.Time) 
 		var pW = w
 
 		for {
-			for _, line := range r.RequestBody {
-				select {
-				case <-ctx.Done():
-					fmt.Println("[debug] context done")
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if _, err := pW.Write(r.RequestBody); err != nil {
+					fmt.Println("[debug] error writing to pipe")
 					return
-				default:
-					//fmt.Println("[debug] write to pipe")
-					if _, err := pW.Write(line); err != nil {
-						fmt.Println("[debug] error writing to pipe")
-						return
-					}
-					if r.qps() > 0 {
-						<-throttle
-						fmt.Println("[debug] throttle")
-					} else {
-						time.Sleep(r.PauseDuration)
-					}
-
 				}
-
+				if r.qps() > 0 {
+					<-throttle
+				} else {
+					time.Sleep(r.PauseDuration)
+				}
 			}
 		}
 	}(pWriter)
