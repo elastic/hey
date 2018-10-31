@@ -212,7 +212,7 @@ func main() {
 		workerReq = &requester.StreamReq{
 			Method:        method,
 			Url:           url,
-			RequestBody:   [][]byte{bodyAll},
+			RequestBody:   bodyAll,
 			Header:        header,
 			Username:      username,
 			Password:      password,
