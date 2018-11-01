@@ -299,7 +299,7 @@ func (b *Work) sendReq(ctx context.Context, client *http.Client, throttle <-chan
 
 }
 
-func (b *Work) runWorker(ctx context.Context, client *http.Client, n int) {
+func (b *Work) runWorker(parent context.Context, client *http.Client, n int) {
 	var throttle <-chan time.Time
 	if b.Req.qps() > 0 {
 		throttle = time.Tick(time.Duration(1e6/(b.Req.qps())) * time.Microsecond)
@@ -311,10 +311,12 @@ func (b *Work) runWorker(ctx context.Context, client *http.Client, n int) {
 		}
 	}
 
+	ctx, cancel := context.WithCancel(parent)
 	for i := 0; i < n; i++ {
 		// Check if application is stopped. Do not send into a closed channel.
 		select {
 		case <-b.stopCh:
+			cancel()
 			return
 		default:
 			b.sendReq(ctx, client, throttle)
